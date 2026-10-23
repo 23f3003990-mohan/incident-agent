@@ -6,7 +6,7 @@ log = logging.getLogger("plan")
 LLM_URL = os.getenv("LLM_URL", "https://aipipe.org/openai/v1/chat/completions")
 LLM_KEY = os.getenv("LLM_API_KEY") or os.getenv("AIPIPE_TOKEN", "")
 LLM_MODEL = os.getenv("LLM_MODEL", "gpt-4.1-mini")
-LLM_TIMEOUT = float(os.getenv("LLM_TIMEOUT", "14"))
+LLM_TIMEOUT = float(os.getenv("LLM_TIMEOUT", "15"))
 EV_RE = re.compile(r"^\s*\[([^\]\s]{2,80})\]", re.M)
 
 
@@ -16,6 +16,10 @@ def canonical(o):
 
 def sha(s):
     return hashlib.sha256(s.encode("utf-8")).hexdigest()
+
+
+class PlannerError(Exception):
+    pass
 
 
 def evidence_ids(transcript):
@@ -51,10 +55,20 @@ def validate(raw, incident, catalog, policy):
     ids = evidence_ids(incident["transcript"])
     tools = {t["name"]: t for t in catalog}
     effects = [e for e in policy.get("effectTools", []) if e in tools]
+    allowed = incident["allowedRootCauses"]
     rc = raw.get("rootCause")
-    if rc not in incident["allowedRootCauses"]:
-        raise ValueError("bad rootCause")
-    ev = [e for e in dict.fromkeys(raw.get("evidence") or []) if e in ids][:4]
+    if rc not in allowed:
+        low = str(rc or "").strip().lower()
+        rc = next((a for a in allowed if a.lower() == low), None) or \
+             next((a for a in allowed if low and (low in a.lower() or a.lower() in low)), None)
+        if rc is None:
+            raise ValueError("bad rootCause")
+    ev = [e for e in dict.fromkeys(str(x).strip().strip("[]") for x in (raw.get("evidence") or [])) if e in ids][:4]
+    for d in (raw.get("diagnostics") or []) + [raw.get("effect") or {}]:
+        for x in (d.get("evidence") or []) if isinstance(d, dict) else []:
+            x = str(x).strip().strip("[]")
+            if len(ev) < 2 and x in ids and x not in ev:
+                ev.append(x)
     if len(ev) < 2:
         raise ValueError("need 2-4 evidence ids")
     maxd = max(1, min(3, int(policy.get("maximumDiagnostics", 3))))
@@ -68,7 +82,7 @@ def validate(raw, incident, catalog, policy):
         if args is None or key in seen:
             continue
         seen.add(key)
-        dev = [e for e in dict.fromkeys(d.get("evidence") or []) if e in ev] or ev[:1]
+        dev = [e for e in dict.fromkeys(str(x).strip().strip("[]") for x in (d.get("evidence") or [])) if e in ev] or ev[:1]
         diags.append({"toolName": name, "arguments": args, "evidence": dev})
     diags = diags[:maxd]
     if not diags:
@@ -79,7 +93,7 @@ def validate(raw, incident, catalog, policy):
     eargs = _fit(e.get("arguments"), tools[e["toolName"]].get("inputSchema"))
     if eargs is None:
         raise ValueError("bad effect args")
-    eev = [x for x in dict.fromkeys(e.get("evidence") or []) if x in ev] or ev[:1]
+    eev = [x for x in dict.fromkeys(str(y).strip().strip("[]") for y in (e.get("evidence") or [])) if x in ev] or ev[:1]
     return {"rootCause": rc, "evidence": ev, "diagnostics": diags,
             "effect": {"toolName": e["toolName"], "arguments": eargs, "evidence": eev}}
 
@@ -108,8 +122,13 @@ async def plan(incident, catalog, policy):
                 p = validate(json.loads(j["choices"][0]["message"]["content"]), incident, catalog, policy)
                 tele.update(ok=True, end=time.time_ns())
                 return p, tele
+            except httpx.HTTPStatusError as e:
+                last = f"llm_http_{e.response.status_code}"
+                log.warning("planner attempt failed: %s %s", last, e.response.text[:300])
+                if e.response.status_code in (401, 403):
+                    break
             except Exception as e:
-                last = e
+                last = f"{type(e).__name__}: {str(e)[:120]}" if isinstance(e, ValueError) else type(e).__name__
                 log.warning("planner attempt failed: %s", e)
     tele["end"] = time.time_ns()
-    raise RuntimeError(f"planner failed: {last}") from None
+    raise PlannerError(last or "llm_timeout")
