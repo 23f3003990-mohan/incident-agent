@@ -6,7 +6,8 @@ log = logging.getLogger("plan")
 LLM_URL = os.getenv("LLM_URL", "https://aipipe.org/openai/v1/chat/completions")
 LLM_KEY = os.getenv("LLM_API_KEY") or os.getenv("AIPIPE_TOKEN", "")
 LLM_MODEL = os.getenv("LLM_MODEL", "gpt-4.1-mini")
-LLM_TIMEOUT = float(os.getenv("LLM_TIMEOUT", "15"))
+LLM_TIMEOUT = float(os.getenv("LLM_TIMEOUT", "14"))
+LLM_ATTEMPT = float(os.getenv("LLM_ATTEMPT_TIMEOUT", "6.5"))
 EV_RE = re.compile(r"^\s*\[([^\]\s]{2,80})\]", re.M)
 
 
@@ -168,7 +169,8 @@ async def plan(incident, catalog, policy):
     async with httpx.AsyncClient() as c:
         while time.time() < deadline - 2:
             try:
-                r = await c.post(LLM_URL, json=body, headers=hdr, timeout=max(2.0, deadline - time.time()))
+                r = await c.post(LLM_URL, json=body, headers=hdr,
+                                 timeout=max(2.0, min(LLM_ATTEMPT, deadline - time.time())))
                 r.raise_for_status()
                 j = r.json()
                 u = j.get("usage") or {}
@@ -198,4 +200,13 @@ async def plan(incident, catalog, policy):
                 last = f"{type(e).__name__}: {str(e)[:120]}" if isinstance(e, ValueError) else type(e).__name__
                 log.warning("planner attempt failed: %s", e)
     tele["end"] = time.time_ns()
-    raise PlannerError(last or "llm_timeout")
+    err = PlannerError(last or "llm_timeout")
+    err.tele = tele
+    raise err
+
+
+def content_key(incident, catalog, policy):
+    """Stable key for identical incident content across runs (run IDs, markers and canaries excluded)."""
+    inc = {k: incident.get(k) for k in ("title", "service", "severity", "transcript", "allowedRootCauses")}
+    pol = {k: v for k, v in policy.items() if k != "doNotExport"}
+    return sha(canonical({"v": 2, "incident": inc, "catalog": catalog, "policy": pol}))
