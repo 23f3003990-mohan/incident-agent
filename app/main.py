@@ -5,7 +5,7 @@ from collections import defaultdict
 from fastapi import FastAPI, Request
 from fastapi.responses import Response
 
-from .plan import PlannerError, canonical, plan, sha
+from .plan import PlannerError, canonical, content_key, plan, sha
 
 logging.basicConfig(level=logging.INFO)
 PROFILE = "ga5-incident-agent/v2"
@@ -15,6 +15,7 @@ _db = sqlite3.connect(DB_PATH, check_same_thread=False, isolation_level=None)
 _db.execute("PRAGMA journal_mode=WAL")
 _db.execute("CREATE TABLE IF NOT EXISTS runs (id TEXT PRIMARY KEY, req_hash TEXT NOT NULL, state TEXT NOT NULL)")
 _db.execute("CREATE TABLE IF NOT EXISTS debug (id TEXT PRIMARY KEY, created REAL, body TEXT)")
+_db.execute("CREATE TABLE IF NOT EXISTS plans (key TEXT PRIMARY KEY, body TEXT NOT NULL)")
 DEBUG_KEY = os.getenv("DEBUG_KEY", "")
 _dbl = threading.Lock()
 _locks = defaultdict(asyncio.Lock)
@@ -251,7 +252,12 @@ def otlp(st):
         chat_attrs.append(attr("gen_ai.usage.input_tokens", ch["inTokens"]))
     if isinstance(ch.get("outTokens"), int):
         chat_attrs.append(attr("gen_ai.usage.output_tokens", ch["outTokens"]))
-    spans.append(span(t["chatSpanId"], t["agentSpanId"], "chat incident-plan", 3, ch["start"], ch["end"], chat_attrs))
+    chat_status = {"code": 0}
+    if ch.get("error"):
+        chat_attrs.append(attr("error.type", ch["error"]))
+        chat_status = {"code": 2}
+    spans.append(span(t["chatSpanId"], t["agentSpanId"], "chat incident-plan", 3, ch["start"], ch["end"], chat_attrs,
+                      status=chat_status))
 
     links = []
     for aid in st["diagIds"] + [st["effectId"]]:
@@ -375,14 +381,24 @@ async def create(b, request):
         trace.update(serverSpanId=hexid(8), agentSpanId=hexid(8), chatSpanId=hexid(8), joinSpanId=hexid(8),
                      gateSpanId=hexid(8))
         inc = b["incident"]
+        ckey = content_key(inc, b["toolCatalog"], b["policy"])
         try:
             pl, tele = await plan({k: inc[k] for k in inc}, b["toolCatalog"], b["policy"])
-        except PlannerError as e:
-            logging.error("planning failed: %s", e)
-            return js({"error": {"code": "PLANNER_UNAVAILABLE", "reason": str(e)}}, 503)
+            with _dbl:
+                _db.execute("INSERT OR REPLACE INTO plans(key, body) VALUES(?,?)", (ckey, json.dumps(pl)))
         except Exception as e:
-            logging.exception("planning failed")
-            return js({"error": {"code": "PLANNER_UNAVAILABLE", "reason": type(e).__name__}}, 503)
+            reason = str(e) if isinstance(e, PlannerError) else type(e).__name__
+            with _dbl:
+                row = _db.execute("SELECT body FROM plans WHERE key=?", (ckey,)).fetchone()
+            if not row:
+                logging.error("planning failed, no cached plan: %s", reason)
+                return js({"error": {"code": "PLANNER_UNAVAILABLE", "reason": reason}}, 503)
+            logging.warning("planning failed (%s); using cached plan for identical incident content", reason)
+            pl = json.loads(row[0])
+            tele = dict(getattr(e, "tele", None) or {"model": os.getenv("LLM_MODEL", "gpt-4.1-mini"),
+                                                     "start": now, "end": time.time_ns()})
+            tele.pop("_raw", None)
+            tele["error"] = reason.split(":")[0]
         raw_model = tele.pop("_raw", None)
         if DEBUG_KEY:  # synthetic exam data only; sensitive object is never stored
             with _dbl:
