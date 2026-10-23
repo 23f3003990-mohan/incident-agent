@@ -14,6 +14,8 @@ os.makedirs(os.path.dirname(DB_PATH) or ".", exist_ok=True)
 _db = sqlite3.connect(DB_PATH, check_same_thread=False, isolation_level=None)
 _db.execute("PRAGMA journal_mode=WAL")
 _db.execute("CREATE TABLE IF NOT EXISTS runs (id TEXT PRIMARY KEY, req_hash TEXT NOT NULL, state TEXT NOT NULL)")
+_db.execute("CREATE TABLE IF NOT EXISTS debug (id TEXT PRIMARY KEY, created REAL, body TEXT)")
+DEBUG_KEY = os.getenv("DEBUG_KEY", "")
 _dbl = threading.Lock()
 _locks = defaultdict(asyncio.Lock)
 TP_RE = re.compile(r"^00-([0-9a-f]{32})-([0-9a-f]{16})-([0-9a-f]{2})$")
@@ -328,6 +330,8 @@ async def route(path: str, request: Request):
     p = strip(path)
     if request.method == "GET" and p == "/_selftest":
         return await selftest()
+    if request.method == "GET" and p.startswith("/_debug"):
+        return debug_view(p, request)
     if request.method in ("GET", "HEAD"):
         m = re.fullmatch(r"/v2/incidents/([^/]+)", p)
         if not m:
@@ -379,6 +383,12 @@ async def create(b, request):
         except Exception as e:
             logging.exception("planning failed")
             return js({"error": {"code": "PLANNER_UNAVAILABLE", "reason": type(e).__name__}}, 503)
+        raw_model = tele.pop("_raw", None)
+        if DEBUG_KEY:  # synthetic exam data only; sensitive object is never stored
+            with _dbl:
+                _db.execute("INSERT OR REPLACE INTO debug(id, created, body) VALUES(?,?,?)", (rid, time.time(), json.dumps(
+                    {"incident": inc, "toolCatalog": b["toolCatalog"], "policy": {k: v for k, v in b["policy"].items() if k != "doNotExport"},
+                     "modelOutput": raw_model, "plan": pl})))
         st = {"runId": rid, "marker": str(b.get("publicMarker", "")), "agentName": str(b.get("agentName") or "incident-response"),
               "trace": trace, "createdAt": now, "chat": tele, "scrub": scrub,
               "approvalRequiredFor": b["policy"].get("approvalRequiredFor", []),
@@ -454,3 +464,16 @@ async def selftest():
         return js({"ok": True, "seconds": round(time.time() - t, 2), "model": tele["model"], "plan": pl})
     except Exception as e:
         return js({"ok": False, "seconds": round(time.time() - t, 2), "reason": str(e) or type(e).__name__}, 503)
+
+
+def debug_view(p, request):
+    if not DEBUG_KEY or request.query_params.get("key") != DEBUG_KEY:
+        return fail(404, "NOT_FOUND")
+    rid = p[len("/_debug"):].strip("/")
+    with _dbl:
+        if not rid:
+            rows = _db.execute("SELECT id, created, body FROM debug ORDER BY created DESC LIMIT 30").fetchall()
+            return js({"runs": [{"runId": r[0], "title": json.loads(r[2])["incident"].get("title"),
+                                 "plan": json.loads(r[2])["plan"]} for r in rows]})
+        r = _db.execute("SELECT body FROM debug WHERE id=?", (rid,)).fetchone()
+    return js(json.loads(r[0])) if r else fail(404, "NOT_FOUND")
