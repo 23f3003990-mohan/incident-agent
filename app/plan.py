@@ -119,7 +119,18 @@ async def plan(incident, catalog, policy):
                 u = j.get("usage") or {}
                 tele.update(inTokens=u.get("prompt_tokens"), outTokens=u.get("completion_tokens"),
                             responseModel=j.get("model"))
-                p = validate(json.loads(j["choices"][0]["message"]["content"]), incident, catalog, policy)
+                content = j["choices"][0]["message"]["content"]
+                try:
+                    p = validate(json.loads(content), incident, catalog, policy)
+                except (ValueError, json.JSONDecodeError) as ve:
+                    # tell the model exactly what was wrong and retry within the time budget
+                    body["messages"] = body["messages"][:2] + [
+                        {"role": "assistant", "content": content},
+                        {"role": "user", "content": f"That plan is invalid: {ve}. rootCause must be one of "
+                         f"allowedRootCauses exactly; evidence must be 2-4 bracketed IDs from the transcript; "
+                         f"diagnostics must be non-effect catalog tools with all required arguments; the effect must be "
+                         f"one of policy.effectTools with all required arguments. Return the full corrected JSON."}]
+                    raise ValueError(str(ve))
                 tele.update(ok=True, end=time.time_ns())
                 return p, tele
             except httpx.HTTPStatusError as e:
