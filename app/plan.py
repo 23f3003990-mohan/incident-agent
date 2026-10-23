@@ -120,6 +120,7 @@ async def plan(incident, catalog, policy):
                 tele.update(inTokens=u.get("prompt_tokens"), outTokens=u.get("completion_tokens"),
                             responseModel=j.get("model"))
                 content = j["choices"][0]["message"]["content"]
+                tele["_raw"] = content[:20000]
                 try:
                     p = validate(json.loads(content), incident, catalog, policy)
                 except (ValueError, json.JSONDecodeError) as ve:
