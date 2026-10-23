@@ -5,7 +5,7 @@ from collections import defaultdict
 from fastapi import FastAPI, Request
 from fastapi.responses import Response
 
-from .plan import canonical, plan, sha
+from .plan import PlannerError, canonical, plan, sha
 
 logging.basicConfig(level=logging.INFO)
 PROFILE = "ga5-incident-agent/v2"
@@ -326,6 +326,8 @@ def strip(p):
 @app.api_route("/{path:path}", methods=["GET", "HEAD", "POST"])
 async def route(path: str, request: Request):
     p = strip(path)
+    if request.method == "GET" and p == "/_selftest":
+        return await selftest()
     if request.method in ("GET", "HEAD"):
         m = re.fullmatch(r"/v2/incidents/([^/]+)", p)
         if not m:
@@ -371,9 +373,12 @@ async def create(b, request):
         inc = b["incident"]
         try:
             pl, tele = await plan({k: inc[k] for k in inc}, b["toolCatalog"], b["policy"])
-        except Exception:
+        except PlannerError as e:
+            logging.error("planning failed: %s", e)
+            return js({"error": {"code": "PLANNER_UNAVAILABLE", "reason": str(e)}}, 503)
+        except Exception as e:
             logging.exception("planning failed")
-            return fail(503, "PLANNER_UNAVAILABLE")
+            return js({"error": {"code": "PLANNER_UNAVAILABLE", "reason": type(e).__name__}}, 503)
         st = {"runId": rid, "marker": str(b.get("publicMarker", "")), "agentName": str(b.get("agentName") or "incident-response"),
               "trace": trace, "createdAt": now, "chat": tele, "scrub": scrub,
               "approvalRequiredFor": b["policy"].get("approvalRequiredFor", []),
@@ -428,3 +433,24 @@ async def receipt(rid, b):
         work["lastView"] = v
         save(rid, h, work)
         return js(v, scrub=work.get("scrub"))
+
+
+async def selftest():
+    """Runs the planner on a tiny synthetic incident (no state stored) to check model access."""
+    inc = {"incidentId": "selftest", "title": "Checkout errors", "service": "checkout", "severity": "SEV-2",
+           "transcript": "[ev_1] 10:02 checkout 5xx rate jumped to 40%\n[ev_2] 10:01 deployment dep-77 rolled out to "
+                         "checkout\n[ev_3] lunch menu updated\n[ev_4] errors only on pods running dep-77",
+           "allowedRootCauses": ["bad_deployment", "capacity_exhaustion", "dependency_outage"]}
+    cat = [{"name": "get_deployment", "description": "Details of a deployment", "inputSchema": {"type": "object",
+            "properties": {"deploymentId": {"type": "string"}}, "required": ["deploymentId"]}},
+           {"name": "rollback_deployment", "description": "Roll back a deployment", "inputSchema": {"type": "object",
+            "properties": {"service": {"type": "string"}, "deploymentId": {"type": "string"}}, "required": ["service", "deploymentId"]}},
+           {"name": "page_owner", "description": "Page the owner", "inputSchema": {"type": "object",
+            "properties": {"service": {"type": "string"}}, "required": ["service"]}}]
+    pol = {"maximumDiagnostics": 3, "effectTools": ["rollback_deployment", "page_owner"], "approvalRequiredFor": ["rollback_deployment"]}
+    t = time.time()
+    try:
+        pl, tele = await plan(inc, cat, pol)
+        return js({"ok": True, "seconds": round(time.time() - t, 2), "model": tele["model"], "plan": pl})
+    except Exception as e:
+        return js({"ok": False, "seconds": round(time.time() - t, 2), "reason": str(e) or type(e).__name__}, 503)
